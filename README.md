@@ -4,26 +4,6 @@ An academic Python project scaffold for indoor localization using WiFi RSSI
 fingerprints from the UJIIndoorLoc dataset. The planned estimator is Weighted
 K-Nearest Neighbors (WKNN) only.
 
-## Project status
-
-Phase 1 established the package structure and basic configuration. Phase 2
-provides CSV loading and schema/data-quality validation. Phase 3 provides RSSI
-preprocessing as a reusable fitted component. Phase 4 adds exploratory
-summaries and plots. Phase 5 adds the WKNN localization engine. Phase 6 adds
-training and model persistence. Phase 7 adds saved-artifact inference.
-Phase 8 adds verified coordinate conversion and official-validation
-evaluation. Phase 9 adds indoor and geographic result visualizations. Phase 10 adds the
-inference-only Streamlit application.
-
-## Scope
-
-- Use only `WAP001` through `WAP520` as model input features.
-- Treat building, floor, and indoor coordinates as prediction outputs.
-  Geographic coordinates should be derived only after a verified coordinate
-  transformation.
-- Do not compare WKNN with other algorithms.
-- Keep raw dataset files local; they are ignored by Git by default.
-- Do not store fabricated metrics or results.
 
 ## Requirements
 
