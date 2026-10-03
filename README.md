@@ -12,7 +12,8 @@ preprocessing as a reusable fitted component. Phase 4 adds exploratory
 summaries and plots. Phase 5 adds the WKNN localization engine. Phase 6 adds
 training and model persistence. Phase 7 adds saved-artifact inference.
 Phase 8 adds verified coordinate conversion and official-validation
-evaluation. Application behavior has not been implemented yet.
+evaluation. Phase 9 adds indoor and geographic result visualizations.
+Application behavior has not been implemented yet.
 
 ## Scope
 
@@ -177,6 +178,20 @@ are computed with the WGS84 ellipsoidal geodesic in meters. Results and plots
 are written to `reports/evaluation_results.csv`,
 `reports/localization_error_distribution.png`, and
 `reports/actual_vs_predicted_coordinates.png`.
+
+## Prediction visualizations
+
+Generate actual/predicted indoor plots, geographic plots, a localization error
+distribution, and an interactive Folium map for one validation sample:
+
+```powershell
+python -m src.visualization.map_visualization
+```
+
+The individual HTML map distinguishes the actual (blue) and predicted (red)
+markers, connects them with a line, and displays the WGS84 geodesic error in
+meters. Static PNGs and the HTML map are saved under `reports/`. Use
+`--sample-index` to select the validation sample for the individual map.
 
 ## Training
 
