@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+site-packages/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# VS Code local settings
+.vscode/
+
+# Local dataset files and generated data
+/data/raw/*
+!/data/raw/.gitkeep
+/data/processed/*
+!/data/processed/.gitkeep
+
+# Trained model artifacts
+/models/*
+!/models/.gitkeep
+*.joblib
+*.pkl
+*.pickle
+
+# Generated reports and plots
+/reports/*
+!/reports/.gitkeep
+*.png
+*.jpg
+*.jpeg
