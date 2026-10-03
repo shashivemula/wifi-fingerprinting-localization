@@ -11,7 +11,8 @@ provides CSV loading and schema/data-quality validation. Phase 3 provides RSSI
 preprocessing as a reusable fitted component. Phase 4 adds exploratory
 summaries and plots. Phase 5 adds the WKNN localization engine. Phase 6 adds
 training and model persistence. Phase 7 adds saved-artifact inference.
-Geographic conversion and application behavior have not been implemented yet.
+Phase 8 adds verified coordinate conversion and official-validation
+evaluation. Application behavior has not been implemented yet.
 
 ## Scope
 
@@ -145,6 +146,37 @@ python -m src.prediction.predictor
 It prints the selected validation row's actual labels alongside predictions.
 Only that row's WAP columns are passed to inference; actual coordinates,
 building, and floor are used only for display.
+
+## Coordinate reference system and evaluation
+
+The UCI UJIIndoorLoc description documents the coordinate and RSSI columns,
+but does not state an EPSG code. The source coordinates are verified here as
+**WGS 84 / Pseudo-Mercator (EPSG:3857)**, in meters, rather than decimal-degree
+GPS values: the sample coordinate `(-7541.2643, 4864920.7782)` converts to
+approximately `39.9929702, -0.0677443`, which falls within the mapped
+Universitat Jaume I campus boundary in Castellon. The EPSG:3395 alternative
+puts the same point at approximately 40.1825° N, outside the campus. CRS
+conversion uses `pyproj` and explicit x/y axis order; geographic outputs are
+returned as `(latitude, longitude)` in WGS84.
+
+Sources used to verify the CRS:
+
+- [UCI UJIIndoorLoc dataset documentation](https://archive.ics.uci.edu/dataset/310/ujiindoorloc) — data description and projected coordinate values.
+- [Universitat Jaume I campus boundary (OpenStreetMap)](https://www.openstreetmap.org/way/46835092) — known geographic reference extent.
+- [EPSG:3857 definition](https://epsg.io/3857) — projected CRS definition and meter units.
+
+Evaluate the saved model using the official validation set without fitting on
+it:
+
+```powershell
+python -m src.evaluation.metrics
+```
+
+The predictor receives only WAP001–WAP520. Geographic localization distances
+are computed with the WGS84 ellipsoidal geodesic in meters. Results and plots
+are written to `reports/evaluation_results.csv`,
+`reports/localization_error_distribution.png`, and
+`reports/actual_vs_predicted_coordinates.png`.
 
 ## Training
 
