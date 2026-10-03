@@ -12,8 +12,8 @@ preprocessing as a reusable fitted component. Phase 4 adds exploratory
 summaries and plots. Phase 5 adds the WKNN localization engine. Phase 6 adds
 training and model persistence. Phase 7 adds saved-artifact inference.
 Phase 8 adds verified coordinate conversion and official-validation
-evaluation. Phase 9 adds indoor and geographic result visualizations.
-Application behavior has not been implemented yet.
+evaluation. Phase 9 adds indoor and geographic result visualizations. Phase 10 adds the
+inference-only Streamlit application.
 
 ## Scope
 
@@ -179,6 +179,21 @@ are written to `reports/evaluation_results.csv`,
 `reports/localization_error_distribution.png`, and
 `reports/actual_vs_predicted_coordinates.png`.
 
+## Streamlit application
+
+Run the inference-only application from the repository root:
+
+```powershell
+streamlit run app/app.py
+```
+
+It loads `models/wknn_localizer.pkl` and
+`models/rssi_preprocessor.pkl`; it does not retrain the model. Provide a CSV
+with all WAP001–WAP520 columns or enter RSSI values for detected WAPs manually.
+Other CSV columns are ignored by inference. Actual-position comparisons appear
+only when the uploaded sample includes valid LONGITUDE, LATITUDE, BUILDINGID,
+and FLOOR labels.
+
 ## Prediction visualizations
 
 Generate actual/predicted indoor plots, geographic plots, a localization error
@@ -209,14 +224,6 @@ default, artifacts are saved to `models/wknn_localizer.pkl` and
 `models/rssi_preprocessor.pkl`.
 Training options, including `--k`, `--distance-metric`, and alternate output
 paths, are available through command-line arguments.
-
-## Run
-
-The current entry point only confirms that the scaffold is ready:
-
-```powershell
-python main.py
-```
 
 ## Tests
 
