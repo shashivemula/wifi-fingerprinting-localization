@@ -10,8 +10,7 @@ Phase 1 established the package structure and basic configuration. Phase 2
 provides CSV loading and schema/data-quality validation. Phase 3 provides RSSI
 preprocessing as a reusable fitted component. Phase 4 adds exploratory
 summaries and plots. Phase 5 adds the WKNN localization engine. Geographic
-conversion, model evaluation, and application behavior have not been
-implemented yet.
+conversion and application behavior have not been implemented yet.
 
 ## Scope
 
@@ -120,6 +119,23 @@ The localizer supports configurable scikit-learn distance metrics and
 serialized with `save()` and restored with `WiFiWKNNLocalizer.load(path)`.
 Coordinates remain in the dataset's source coordinate system; no geographic
 transformation is performed.
+
+## Training
+
+Train and save the WKNN localizer and fitted RSSI preprocessing configuration:
+
+```powershell
+python -m src.training.train
+```
+
+The pipeline validates and fits only `trainingData.csv`. Its optional
+reproducible holdout evaluation is drawn from the training CSV, keeping
+identical WAP fingerprints in the same split to reduce duplicate-fingerprint
+leakage. It does not load or fit on the official validation dataset. By
+default, artifacts are saved to `models/wknn_localizer.pkl` and
+`models/rssi_preprocessor.pkl`.
+Training options, including `--k`, `--distance-metric`, and alternate output
+paths, are available through command-line arguments.
 
 ## Run
 
