@@ -9,8 +9,9 @@ K-Nearest Neighbors (WKNN) only.
 Phase 1 established the package structure and basic configuration. Phase 2
 provides CSV loading and schema/data-quality validation. Phase 3 provides RSSI
 preprocessing as a reusable fitted component. Phase 4 adds exploratory
-summaries and plots. WKNN estimation, geographic conversion, model evaluation,
-and application behavior have not been implemented yet.
+summaries and plots. Phase 5 adds the WKNN localization engine. Geographic
+conversion, model evaluation, and application behavior have not been
+implemented yet.
 
 ## Scope
 
@@ -90,6 +91,35 @@ python -m src.analysis.explore_data
 The script saves building, floor, detected-WAP-count, RSSI, indoor-coordinate,
 and building/floor location plots under `reports/`. Use `--training`,
 `--validation`, and `--reports-dir` to select alternate paths.
+
+## WKNN localization
+
+Fit from the complete training DataFrame, or pass the WAP feature DataFrame and
+the four target columns separately. When making predictions, pass
+`WAP001`–`WAP520` in a DataFrame; additional label or metadata columns are
+ignored. Apply the same fitted `RSSIPreprocessor` to training and inference
+fingerprints before fitting or prediction:
+
+```python
+from src.data.loader import load_training_data
+from src.model.wknn_localizer import WiFiWKNNLocalizer
+from src.preprocessing.rssi_preprocessor import RSSIPreprocessor
+
+training = load_training_data()
+preprocessor = RSSIPreprocessor()
+training_features = preprocessor.fit_transform(training)
+localizer = WiFiWKNNLocalizer(k=5).fit(training_features.join(training[
+    ["LONGITUDE", "LATITUDE", "BUILDINGID", "FLOOR"]
+]))
+prediction = localizer.predict_single(training_features.iloc[[0]])
+print(prediction)
+```
+
+The localizer supports configurable scikit-learn distance metrics and
+`inverse_distance` or `uniform` neighbor weighting. Fitted models can be
+serialized with `save()` and restored with `WiFiWKNNLocalizer.load(path)`.
+Coordinates remain in the dataset's source coordinate system; no geographic
+transformation is performed.
 
 ## Run
 
