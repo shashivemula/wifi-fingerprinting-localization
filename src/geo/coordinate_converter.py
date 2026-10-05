@@ -9,12 +9,10 @@ from pyproj import Transformer
 
 CoordinateValues: TypeAlias = float | np.ndarray
 
-# UJIIndoorLoc does not identify the EPSG code in its UCI dataset description.
-# The recorded coordinates (e.g. x=-7541.2643, y=4864920.7782) transform from
-# EPSG:3857 to (lat=39.9929702, lon=-0.0677443), inside the mapped Universitat
-# Jaume I campus boundary. The corresponding EPSG:3395 result is about 40.1825
-# degrees north, outside the campus. Reference sources are documented in
-# README.md; the UCI page itself does not name an EPSG code.
+# UJIIndoorLoc stores projected metric coordinates, but its original paper and
+# UCI dataset description do not specify an EPSG code. EPSG:3857 is an
+# implementation assumption based on empirical verification and supporting
+# geographic references documented in README.md, not a provider designation.
 DATASET_PROJECTED_CRS = "EPSG:3857"
 WGS84_GEOGRAPHIC_CRS = "EPSG:4326"
 
@@ -42,7 +40,11 @@ def projected_to_latlon(
     x: CoordinateValues,
     y: CoordinateValues,
 ) -> tuple[CoordinateValues, CoordinateValues]:
-    """Convert UJIIndoorLoc EPSG:3857 x/y values to WGS84 latitude/longitude.
+    """Convert projected x/y values to WGS84 latitude/longitude.
+
+    This conversion assumes EPSG:3857 for UJIIndoorLoc's projected metric
+    coordinates. The source dataset does not explicitly identify this EPSG
+    code; see README.md for the empirical verification and references.
 
     Args:
         x: Projected easting in meters, scalar or array-like.
@@ -73,7 +75,11 @@ def latlon_to_projected(
     latitude: CoordinateValues,
     longitude: CoordinateValues,
 ) -> tuple[CoordinateValues, CoordinateValues]:
-    """Convert WGS84 decimal-degree latitude/longitude to UJIIndoorLoc x/y.
+    """Convert WGS84 decimal degrees to projected x/y under the CRS assumption.
+
+    The output uses EPSG:3857, the implementation's empirical assumption for
+    UJIIndoorLoc's projected metric coordinates; the source dataset does not
+    explicitly identify an EPSG code.
 
     Args:
         latitude: WGS84 latitude in decimal degrees, scalar or array-like.

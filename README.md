@@ -1,24 +1,48 @@
 # WiFi Fingerprinting Based Indoor Localization Using Weighted K-Nearest Neighbors
 
-An academic Python project scaffold for indoor localization using WiFi RSSI
-fingerprints from the UJIIndoorLoc dataset. The planned estimator is Weighted
+An academic Python project for indoor localization using WiFi RSSI
+fingerprints from the UJIIndoorLoc dataset. The estimator is Weighted
 K-Nearest Neighbors (WKNN) only.
 
+## Scope
+
+- Only `WAP001` through `WAP520` are model input features.
+- `LONGITUDE`, `LATITUDE`, `FLOOR`, `BUILDINGID`, `SPACEID`,
+  `RELATIVEPOSITION`, `USERID`, `PHONEID`, and `TIMESTAMP` are targets or
+  metadata, never model input features.
+- No other ML algorithms are implemented or compared.
+- Raw dataset files remain local and are ignored by Git by default.
 
 ## Requirements
 
 - Python 3.10 or newer
 - Dependencies listed in `requirements.txt`
 
-## Setup
+## Reproducible setup and execution
 
-From the project root in the VS Code terminal:
+From the repository root in the VS Code terminal, create a virtual
+environment, install requirements, and place the original
+`trainingData.csv` and `validationData.csv` files in `data/raw/`:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 ```
+
+Train using only the training CSV, evaluate using the official validation CSV,
+or launch the inference-only application:
+
+```powershell
+python -m src.training.train
+python -m src.evaluation.metrics
+streamlit run app/app.py
+```
+
+Run the test suite with `python -m pytest -q`. Model artifacts are saved under
+`models/`; evaluation and visualization outputs are saved under `reports/`.
+
+## Dataset placement and loading
 
 Place `trainingData.csv` and `validationData.csv` in `data/raw/`. The loader
 checks the expected names and reports which CSV files are available if one is
@@ -45,10 +69,11 @@ reference system. Validation does not alter or preprocess the DataFrame.
 ## RSSI preprocessing and exploratory analysis
 
 `RSSIPreprocessor` selects only `WAP001` through `WAP520`, converts numeric
-values, replaces the UJIIndoorLoc unavailable sentinel (`100`) and nulls with
-the configurable default `-110`, and returns the features in canonical WAP
-order. Fit it once on the training DataFrame and reuse the fitted, pickleable
-instance for inference:
+values, treats RSSI `100` as UJIIndoorLoc's unavailable/not-detected
+representation, replaces it and nulls with the configurable default `-110`,
+and returns features in canonical WAP order. The training pipeline saves the
+fitted, pickleable preprocessor and inference reuses that artifact. The
+pipeline reads the raw CSVs; it does not modify them.
 
 ```python
 from src.data.loader import load_datasets
@@ -97,11 +122,19 @@ prediction = localizer.predict_single(training_features.iloc[[0]])
 print(prediction)
 ```
 
-The localizer supports configurable scikit-learn distance metrics and
-`inverse_distance` or `uniform` neighbor weighting. Fitted models can be
-serialized with `save()` and restored with `WiFiWKNNLocalizer.load(path)`.
-Coordinates remain in the dataset's source coordinate system; no geographic
-transformation is performed.
+Training defaults are **K=5**, **Euclidean distance**, and
+**inverse-distance weighting**. Exact zero-distance neighbors are handled by
+assigning weight only to zero-distance neighbors before normalization. Indoor
+coordinates are a distance-weighted average; building and floor are predicted
+by weighted neighbor voting. These are distance-based neighbor weights, not
+probabilities or calibrated confidence scores. Fitted models can be serialized
+with `save()` and restored with `WiFiWKNNLocalizer.load(path)`.
+
+The checked training dataset contains **637 exact duplicate rows**. They are
+reported and are not silently removed. The optional holdout hashes complete
+WAP fingerprints and uses those hashes as split groups, so identical
+fingerprints cannot fall in both holdout and fit partitions. Duplicates remain
+in the final fit on all training rows.
 
 ## Inference
 
@@ -118,7 +151,10 @@ one_prediction = predictor.predict_single(wap_fingerprint)
 batch_predictions = predictor.predict_batch(wap_fingerprint_dataframe)
 ```
 
-Run the validation-sample demonstration from the VS Code terminal:
+The optional single-sample demonstration reads one validation row for a
+post-fit inference/display check. It passes only that row's WAP columns to the
+predictor; the actual labels are displayed after prediction and are not used
+for fitting or tuning. Run it with:
 
 ```powershell
 python -m src.prediction.predictor
@@ -130,15 +166,16 @@ building, and floor are used only for display.
 
 ## Coordinate reference system and evaluation
 
-The UCI UJIIndoorLoc description documents the coordinate and RSSI columns,
-but does not state an EPSG code. The source coordinates are verified here as
-**WGS 84 / Pseudo-Mercator (EPSG:3857)**, in meters, rather than decimal-degree
-GPS values: the sample coordinate `(-7541.2643, 4864920.7782)` converts to
-approximately `39.9929702, -0.0677443`, which falls within the mapped
-Universitat Jaume I campus boundary in Castellon. The EPSG:3395 alternative
-puts the same point at approximately 40.1825° N, outside the campus. CRS
-conversion uses `pyproj` and explicit x/y axis order; geographic outputs are
-returned as `(latitude, longitude)` in WGS84.
+UJIIndoorLoc stores location coordinates in projected metric units. This
+implementation uses **EPSG:3857** for projected-to-WGS84 conversion based on
+empirical verification and supporting geographic reference material; the
+original dataset paper does not explicitly specify an EPSG code. For example,
+the sample coordinate `(-7541.2643, 4864920.7782)` converts to approximately
+`39.9929702, -0.0677443`, within the mapped Universitat Jaume I campus
+boundary in Castellon. This is an implementation assumption, not a CRS
+designation attributed to the dataset provider. Conversion uses `pyproj` with
+explicit x/y axis order; geographic outputs are returned as
+`(latitude, longitude)` in WGS84.
 
 Sources used to verify the CRS:
 
@@ -172,7 +209,10 @@ It loads `models/wknn_localizer.pkl` and
 with all WAP001–WAP520 columns or enter RSSI values for detected WAPs manually.
 Other CSV columns are ignored by inference. Actual-position comparisons appear
 only when the uploaded sample includes valid LONGITUDE, LATITUDE, BUILDINGID,
-and FLOOR labels.
+and FLOOR labels. Ground truth is not required for normal inference. The app
+does not directly scan WiFi hardware; RSSI values must be supplied through a
+CSV or manual entry. Predictions include building, floor, indoor X/Y, and
+derived WGS84 latitude/longitude.
 
 ## Prediction visualizations
 
@@ -199,8 +239,9 @@ python -m src.training.train
 The pipeline validates and fits only `trainingData.csv`. Its optional
 reproducible holdout evaluation is drawn from the training CSV, keeping
 identical WAP fingerprints in the same split to reduce duplicate-fingerprint
-leakage. It does not load or fit on the official validation dataset. By
-default, artifacts are saved to `models/wknn_localizer.pkl` and
+leakage. It does not load or fit on the official validation dataset. Final
+validation metrics are calculated separately by `src.evaluation.metrics`.
+By default, artifacts are saved to `models/wknn_localizer.pkl` and
 `models/rssi_preprocessor.pkl`.
 Training options, including `--k`, `--distance-metric`, and alternate output
 paths, are available through command-line arguments.
