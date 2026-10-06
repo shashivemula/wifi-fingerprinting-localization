@@ -206,13 +206,19 @@ streamlit run app/app.py
 
 It loads `models/wknn_localizer.pkl` and
 `models/rssi_preprocessor.pkl`; it does not retrain the model. Provide a CSV
-with all WAP001–WAP520 columns or enter RSSI values for detected WAPs manually.
-Other CSV columns are ignored by inference. Actual-position comparisons appear
-only when the uploaded sample includes valid LONGITUDE, LATITUDE, BUILDINGID,
-and FLOOR labels. Ground truth is not required for normal inference. The app
-does not directly scan WiFi hardware; RSSI values must be supplied through a
-CSV or manual entry. Predictions include building, floor, indoor X/Y, and
-derived WGS84 latitude/longitude.
+with all WAP001–WAP520 columns, enter RSSI rows for only the detected WAPs, or
+choose a row from the UJIIndoorLoc validation sample demonstration. The
+validation demonstration is the primary example and compares ground truth only
+after predicting with the WAP columns. Other CSV columns are ignored by
+inference; labels are optional. Normal inference does not require ground
+truth. The app does not directly scan WiFi hardware; RSSI values must be
+supplied through a CSV or manual entry.
+
+The app displays building, floor, WGS84 latitude/longitude, detected-WAP
+count, and local indoor X/Y offsets relative to the coordinate minimum for the
+predicted building/floor. The plot uses those local indoor offsets, not the
+large projected model coordinates. Projected model coordinates are kept
+internal to inference and are not presented as GPS coordinates.
 
 ## Prediction visualizations
 

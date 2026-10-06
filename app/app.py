@@ -1,8 +1,9 @@
-"""Streamlit interface for inference with the saved WiFi WKNN model."""
+"""Streamlit interface for WiFi WKNN indoor localization inference."""
 
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
@@ -21,15 +22,45 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import MODELS_DIR, RSSI_FEATURE_COLUMNS
+from src.data.loader import DatasetLoadError, load_validation_data
 from src.geo.coordinate_converter import projected_to_latlon
 from src.model.wknn_localizer import LocalizationPrediction
 from src.prediction.predictor import WiFiFingerprintPredictor
+from src.preprocessing.rssi_preprocessor import (
+    RSSI_MAX_VALUE,
+    RSSI_MIN_VALUE,
+    UJIINDOORLOC_UNAVAILABLE_VALUE,
+)
 
 MODEL_PATH = MODELS_DIR / "wknn_localizer.pkl"
 PREPROCESSOR_PATH = MODELS_DIR / "rssi_preprocessor.pkl"
 GROUND_TRUTH_COLUMNS = ("LONGITUDE", "LATITUDE", "BUILDINGID", "FLOOR")
-RSSI_MISSING_VALUE = 100
 WGS84_GEOD = Geod(ellps="WGS84")
+INPUT_MODES = (
+    "UJIIndoorLoc Validation Sample",
+    "Upload WiFi Fingerprint",
+    "Manual RSSI",
+)
+
+
+@dataclass(frozen=True)
+class InferenceResult:
+    """Prediction and display metadata for one WAP-only fingerprint."""
+
+    prediction: LocalizationPrediction
+    latitude: float
+    longitude: float
+    detected_wap_count: int
+
+
+@dataclass(frozen=True)
+class BuildingFloorLocations:
+    """Training locations and local-coordinate origin for one building/floor."""
+
+    origin_x: float
+    origin_y: float
+    local_x: np.ndarray
+    local_y: np.ndarray
 
 
 @st.cache_resource(show_spinner="Loading saved WKNN model...")
@@ -38,8 +69,14 @@ def load_predictor(model_path: str, preprocessor_path: str) -> WiFiFingerprintPr
     return WiFiFingerprintPredictor(model_path, preprocessor_path)
 
 
+@st.cache_data(show_spinner="Loading UJIIndoorLoc validation samples...")
+def load_validation_samples() -> pd.DataFrame:
+    """Load the official validation CSV for the explicit demonstration mode."""
+    return load_validation_data()
+
+
 def validate_upload(dataframe: pd.DataFrame) -> pd.DataFrame:
-    """Validate a CSV and return only its WAP columns for inference."""
+    """Validate a CSV and return only its WAP columns in canonical order."""
     if dataframe.empty:
         raise ValueError("The uploaded CSV contains no samples.")
     if dataframe.columns.duplicated().any():
@@ -60,8 +97,56 @@ def validate_upload(dataframe: pd.DataFrame) -> pd.DataFrame:
     return dataframe.loc[:, RSSI_FEATURE_COLUMNS]
 
 
+def build_manual_fingerprint(entries: pd.DataFrame) -> pd.DataFrame:
+    """Build a complete WAP row from only the access points the user detected."""
+    required_columns = ("WAP ID", "RSSI")
+    missing_columns = [
+        column for column in required_columns if column not in entries.columns
+    ]
+    if missing_columns:
+        raise ValueError(f"Manual input is missing columns: {missing_columns}.")
+
+    rows = entries.loc[:, required_columns].dropna(how="all")
+    if rows.empty:
+        raise ValueError("Add at least one detected WAP and its RSSI value.")
+
+    fingerprint = {
+        column: UJIINDOORLOC_UNAVAILABLE_VALUE for column in RSSI_FEATURE_COLUMNS
+    }
+    seen_waps: set[str] = set()
+    for row_number, (_, row) in enumerate(rows.iterrows(), start=1):
+        wap_id = row["WAP ID"]
+        rssi = row["RSSI"]
+        if pd.isna(wap_id) or pd.isna(rssi):
+            raise ValueError(
+                f"Manual input row {row_number} must include both WAP ID and RSSI."
+            )
+        wap_id = str(wap_id)
+        if wap_id not in RSSI_FEATURE_COLUMNS:
+            raise ValueError(f"{wap_id!r} is not a valid WAP001-WAP520 feature.")
+        if wap_id in seen_waps:
+            raise ValueError(f"{wap_id} is listed more than once.")
+        try:
+            numeric_rssi = float(rssi)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"RSSI for {wap_id} must be numeric.") from exc
+        if (
+            not np.isfinite(numeric_rssi)
+            or numeric_rssi < RSSI_MIN_VALUE
+            or numeric_rssi > RSSI_MAX_VALUE
+        ):
+            raise ValueError(
+                f"RSSI for {wap_id} must be between {RSSI_MIN_VALUE} and "
+                f"{RSSI_MAX_VALUE} dBm; 100 means not detected."
+            )
+        fingerprint[wap_id] = numeric_rssi
+        seen_waps.add(wap_id)
+
+    return pd.DataFrame([fingerprint], columns=RSSI_FEATURE_COLUMNS)
+
+
 def _get_ground_truth(row: pd.Series) -> dict[str, int | float] | None:
-    """Return valid actual labels separately, if all expected labels exist."""
+    """Read complete numeric labels for display only, after inference."""
     if any(column not in row.index for column in GROUND_TRUTH_COLUMNS):
         return None
     try:
@@ -73,6 +158,11 @@ def _get_ground_truth(row: pd.Series) -> dict[str, int | float] | None:
         return None
     if not all(np.isfinite(value) for value in values.values()):
         return None
+    if any(
+        not values[column].is_integer()
+        for column in ("BUILDINGID", "FLOOR")
+    ):
+        return None
     return {
         "x": values["LONGITUDE"],
         "y": values["LATITUDE"],
@@ -81,13 +171,87 @@ def _get_ground_truth(row: pd.Series) -> dict[str, int | float] | None:
     }
 
 
+def _detected_wap_count(wap_frame: pd.DataFrame) -> int:
+    """Count finite detected RSSI readings, excluding sentinel 100 and nulls."""
+    numeric = wap_frame.loc[:, RSSI_FEATURE_COLUMNS].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+    return int(
+        (
+            numeric.ge(RSSI_MIN_VALUE)
+            & numeric.le(RSSI_MAX_VALUE)
+            & np.isfinite(numeric)
+        )
+        .sum(axis=1)
+        .iloc[0]
+    )
+
+
+def _predict_fingerprint(
+    predictor: WiFiFingerprintPredictor,
+    fingerprint: pd.DataFrame,
+) -> InferenceResult:
+    """Preprocess and predict using WAP features only."""
+    wap_frame = validate_upload(fingerprint)
+    transformed = predictor.preprocessor.transform(wap_frame)
+    prediction = predictor.model.predict_single(transformed)
+    latitude, longitude = projected_to_latlon(prediction.x, prediction.y)
+    return InferenceResult(
+        prediction=prediction,
+        latitude=float(latitude),
+        longitude=float(longitude),
+        detected_wap_count=_detected_wap_count(wap_frame),
+    )
+
+
+def _building_floor_locations(
+    predictor: WiFiFingerprintPredictor,
+    building: int,
+    floor: int,
+) -> BuildingFloorLocations:
+    """Get saved training locations for a building/floor and localize origin."""
+    model = predictor.model
+    coordinates = model._coordinates
+    buildings = model._building_ids
+    floors = model._floors
+    if coordinates is None or buildings is None or floors is None:
+        raise RuntimeError("Saved WKNN model is missing its fitted location data.")
+
+    mask = (buildings == building) & (floors == floor)
+    locations = coordinates[mask]
+    if locations.size == 0:
+        raise RuntimeError(
+            f"The saved model contains no training locations for building "
+            f"{building}, floor {floor}."
+        )
+    origin_x = float(locations[:, 0].min())
+    origin_y = float(locations[:, 1].min())
+    local_locations = locations - np.array([origin_x, origin_y])
+    return BuildingFloorLocations(
+        origin_x=origin_x,
+        origin_y=origin_y,
+        local_x=local_locations[:, 0],
+        local_y=local_locations[:, 1],
+    )
+
+
+def _local_coordinates(
+    x: float,
+    y: float,
+    locations: BuildingFloorLocations,
+) -> tuple[float, float]:
+    """Convert projected model coordinates to local floor-relative offsets."""
+    return x - locations.origin_x, y - locations.origin_y
+
+
 def _distance_meters(
     actual_x: float,
     actual_y: float,
     predicted_x: float,
     predicted_y: float,
 ) -> float:
-    """Calculate WGS84 geodesic distance from dataset projected coordinates."""
+    """Calculate WGS84 geodesic distance for two projected model positions."""
     actual_latitude, actual_longitude = projected_to_latlon(actual_x, actual_y)
     predicted_latitude, predicted_longitude = projected_to_latlon(
         predicted_x,
@@ -103,191 +267,293 @@ def _distance_meters(
 
 
 def _make_location_chart(
-    prediction: LocalizationPrediction,
+    result: InferenceResult,
+    locations: BuildingFloorLocations,
     ground_truth: dict[str, int | float] | None,
+    actual_local: tuple[float, float] | None,
+    localization_error: float | None,
 ) -> plt.Figure:
-    """Plot the prediction, neighbors, and actual point only when labeled."""
-    figure, axis = plt.subplots(figsize=(8, 6))
-    neighbors = prediction.neighbors
-    if neighbors:
+    """Plot prediction in local building/floor coordinates, never projected axes."""
+    prediction = result.prediction
+    predicted_local = _local_coordinates(prediction.x, prediction.y, locations)
+    neighbor_local = [
+        _local_coordinates(neighbor.x, neighbor.y, locations)
+        for neighbor in prediction.neighbors
+    ]
+    figure, axis = plt.subplots(figsize=(9, 7))
+
+    axis.scatter(
+        locations.local_x,
+        locations.local_y,
+        color="#cbd5e1",
+        s=9,
+        alpha=0.35,
+        label="Training locations on this building/floor",
+        zorder=1,
+    )
+    if neighbor_local:
         axis.scatter(
-            [neighbor.x for neighbor in neighbors],
-            [neighbor.y for neighbor in neighbors],
-            c=[neighbor.distance for neighbor in neighbors],
-            cmap="Blues",
-            s=70,
+            [point[0] for point in neighbor_local],
+            [point[1] for point in neighbor_local],
+            color="#475569",
+            s=34,
             marker="^",
             label="Nearest training fingerprints",
+            zorder=2,
         )
-    axis.scatter(
-        prediction.x,
-        prediction.y,
-        color="#d62728",
-        marker="*",
-        s=220,
-        edgecolor="black",
-        linewidth=0.6,
-        label="Predicted position",
-        zorder=3,
-    )
 
-    title = "Predicted indoor position"
-    if ground_truth is not None:
+    axis.scatter(
+        predicted_local[0],
+        predicted_local[1],
+        color="#dc2626",
+        marker="*",
+        s=280,
+        edgecolor="black",
+        linewidth=0.7,
+        label="Predicted location",
+        zorder=5,
+    )
+    if ground_truth is not None and actual_local is not None:
         axis.scatter(
-            float(ground_truth["x"]),
-            float(ground_truth["y"]),
-            color="#2ca02c",
+            actual_local[0],
+            actual_local[1],
+            color="#2563eb",
             marker="o",
-            s=100,
-            edgecolor="black",
-            linewidth=0.6,
-            label="Actual position",
+            s=115,
+            edgecolor="white",
+            linewidth=1.0,
+            label="Ground truth",
             zorder=4,
         )
         axis.plot(
-            [float(ground_truth["x"]), prediction.x],
-            [float(ground_truth["y"]), prediction.y],
-            color="gray",
+            [actual_local[0], predicted_local[0]],
+            [actual_local[1], predicted_local[1]],
+            color="#334155",
             linestyle="--",
-            linewidth=1,
-            label="Actual-to-predicted error",
-            zorder=1,
+            linewidth=1.5,
+            label="Ground truth to prediction",
+            zorder=3,
         )
-        title = "Actual and predicted indoor position"
+        if localization_error is not None:
+            axis.annotate(
+                f"{localization_error:.2f} m",
+                xy=predicted_local,
+                xytext=(8, 8),
+                textcoords="offset points",
+                fontsize=10,
+                fontweight="bold",
+            )
 
     axis.set(
-        title=title,
-        xlabel="X (EPSG:3857 meters)",
-        ylabel="Y (EPSG:3857 meters)",
+        title=f"Building {prediction.building} — Floor {prediction.floor}",
+        xlabel="Indoor X (meters)",
+        ylabel="Indoor Y (meters)",
     )
-    axis.set_aspect("equal", adjustable="datalim")
+    x_extent = list(locations.local_x)
+    y_extent = list(locations.local_y)
+    x_extent.extend((predicted_local[0],))
+    y_extent.extend((predicted_local[1],))
+    if actual_local is not None:
+        x_extent.append(actual_local[0])
+        y_extent.append(actual_local[1])
+    x_min = min(x_extent)
+    x_max = max(x_extent)
+    y_min = min(y_extent)
+    y_max = max(y_extent)
+    x_span = max(float(np.ptp(x_extent)), 1.0)
+    y_span = max(float(np.ptp(y_extent)), 1.0)
+    x_padding = max(x_span * 0.06, 1.0)
+    y_padding = max(y_span * 0.06, 1.0)
+    axis.set_xlim(x_min - x_padding, x_max + x_padding)
+    axis.set_ylim(y_min - y_padding, y_max + y_padding)
+    axis.set_aspect("equal", adjustable="box")
     axis.grid(alpha=0.25)
     axis.legend(loc="best")
     figure.tight_layout()
     return figure
 
 
-def _display_prediction(
+def _render_prediction(
     predictor: WiFiFingerprintPredictor,
-    wap_frame: pd.DataFrame,
-    ground_truth: dict[str, int | float] | None,
+    result: InferenceResult,
+    ground_truth: dict[str, int | float] | None = None,
 ) -> None:
-    """Run inference and display predicted location, neighbors, and optional truth."""
-    try:
-        transformed = predictor.preprocessor.transform(wap_frame)
-        model_prediction = predictor.model.predict_single(transformed)
-        prediction = {
-            "building": model_prediction.building,
-            "floor": model_prediction.floor,
-            "x": model_prediction.x,
-            "y": model_prediction.y,
-        }
-        latitude, longitude = projected_to_latlon(prediction["x"], prediction["y"])
-    except (ValueError, RuntimeError, TypeError) as exc:
-        st.error(f"Could not generate a prediction: {exc}")
-        return
-
-    detected_count = int(
-        transformed.ne(predictor.preprocessor.replacement_value).sum(axis=1).iloc[0]
+    """Display geographic prediction and local indoor view, with optional truth."""
+    prediction = result.prediction
+    locations = _building_floor_locations(
+        predictor,
+        prediction.building,
+        prediction.floor,
     )
-    st.subheader("Prediction")
-    result_columns = st.columns(4)
-    result_columns[0].metric("Predicted Building", str(prediction["building"]))
-    result_columns[1].metric("Predicted Floor", str(prediction["floor"]))
-    result_columns[2].metric("Indoor X", f"{prediction['x']:.3f} m")
-    result_columns[3].metric("Indoor Y", f"{prediction['y']:.3f} m")
-    geographic_columns = st.columns(2)
-    geographic_columns[0].metric("Latitude (WGS84)", f"{latitude:.8f}°")
-    geographic_columns[1].metric("Longitude (WGS84)", f"{longitude:.8f}°")
-    st.metric("Detected WAP count", f"{detected_count} / {len(RSSI_FEATURE_COLUMNS)}")
+    predicted_local = _local_coordinates(prediction.x, prediction.y, locations)
+
+    st.markdown("### Prediction")
+    st.caption(
+        "Latitude/longitude are geographic WGS84 coordinates. Indoor X/Y below "
+        "are local visualization offsets for this building and floor. Projected "
+        "model coordinates are retained internally and are not GPS coordinates."
+    )
 
     if ground_truth is not None:
         actual_latitude, actual_longitude = projected_to_latlon(
             float(ground_truth["x"]),
             float(ground_truth["y"]),
         )
+        actual_local = _local_coordinates(
+            float(ground_truth["x"]),
+            float(ground_truth["y"]),
+            locations,
+        )
         localization_error = _distance_meters(
             float(ground_truth["x"]),
             float(ground_truth["y"]),
-            prediction["x"],
-            prediction["y"],
-        )
-        st.subheader("Actual vs predicted (uploaded labels)")
-        st.write(
-            {
-                "Actual building": ground_truth["building"],
-                "Actual floor": ground_truth["floor"],
-                "Actual X": float(ground_truth["x"]),
-                "Actual Y": float(ground_truth["y"]),
-                "Actual latitude": actual_latitude,
-                "Actual longitude": actual_longitude,
-                "Localization error (meters)": localization_error,
-            }
-        )
-    else:
-        st.info(
-            "No complete ground-truth labels were supplied. Only the predicted "
-            "position is shown; actual location and localization error are not "
-            "available."
+            prediction.x,
+            prediction.y,
         )
 
-    with st.expander("Nearest training fingerprints and weighting"):
+        ground_truth_column, prediction_column = st.columns(2)
+        with ground_truth_column:
+            st.markdown("#### Ground Truth")
+            st.metric("Building", str(ground_truth["building"]))
+            st.metric("Floor", str(ground_truth["floor"]))
+            st.metric("Latitude", f"{actual_latitude:.8f}°")
+            st.metric("Longitude", f"{actual_longitude:.8f}°")
+            st.caption(
+                f"Local indoor position: X {actual_local[0]:.2f} m, "
+                f"Y {actual_local[1]:.2f} m"
+            )
+        with prediction_column:
+            st.markdown("#### Prediction")
+            st.metric("Building", str(prediction.building))
+            st.metric("Floor", str(prediction.floor))
+            st.metric("Latitude", f"{result.latitude:.8f}°")
+            st.metric("Longitude", f"{result.longitude:.8f}°")
+            st.caption(
+                f"Local indoor position: X {predicted_local[0]:.2f} m, "
+                f"Y {predicted_local[1]:.2f} m"
+            )
+        st.metric("Localization Error", f"{localization_error:.3f} m")
+    else:
+        actual_local = None
+        localization_error = None
+        prediction_columns = st.columns(4)
+        prediction_columns[0].metric("Building", str(prediction.building))
+        prediction_columns[1].metric("Floor", str(prediction.floor))
+        prediction_columns[2].metric("Latitude (WGS84)", f"{result.latitude:.8f}°")
+        prediction_columns[3].metric("Longitude (WGS84)", f"{result.longitude:.8f}°")
+        indoor_columns = st.columns(2)
+        indoor_columns[0].metric("Indoor X", f"{predicted_local[0]:.2f} m")
+        indoor_columns[1].metric("Indoor Y", f"{predicted_local[1]:.2f} m")
+
+    st.metric("Detected WAPs", f"{result.detected_wap_count} / 520")
+    st.info(
+        "WKNN compares this WiFi fingerprint with fingerprints collected at "
+        "known locations in the UJIIndoorLoc database. The predicted position "
+        "is derived from the nearest fingerprints using distance-based weighting."
+    )
+
+    with st.expander("Nearest training fingerprints"):
         st.caption(
-            "RSSI-space distance is measured over the 520 preprocessed WAP "
-            "features; it is not a physical distance in meters. WKNN weights "
-            "the coordinate estimate by inverse RSSI-space distance. These "
-            "weights are not calibrated probabilities or confidence scores."
+            "RSSI-space distances and distance-based neighbor weights are not "
+            "physical distances or calibrated confidence probabilities."
         )
-        neighbors = pd.DataFrame(
-            [
+        neighbor_rows = []
+        for neighbor in prediction.neighbors:
+            local_x, local_y = _local_coordinates(neighbor.x, neighbor.y, locations)
+            neighbor_rows.append(
                 {
                     "Training row": neighbor.index,
-                    "RSSI-space distance": neighbor.distance,
-                    "WKNN weight": neighbor.weight,
                     "Building": neighbor.building,
                     "Floor": neighbor.floor,
-                    "X": neighbor.x,
-                    "Y": neighbor.y,
+                    "Indoor X (m)": local_x,
+                    "Indoor Y (m)": local_y,
+                    "RSSI-space distance": neighbor.distance,
+                    "Distance-based weight": neighbor.weight,
                 }
-                for neighbor in model_prediction.neighbors
-            ]
+            )
+        st.dataframe(
+            pd.DataFrame(neighbor_rows),
+            width="stretch",
+            hide_index=True,
         )
-        st.dataframe(neighbors, width="stretch", hide_index=True)
 
-    chart = _make_location_chart(model_prediction, ground_truth)
+    chart = _make_location_chart(
+        result,
+        locations,
+        ground_truth,
+        actual_local,
+        localization_error,
+    )
     st.pyplot(chart, clear_figure=True, width="stretch")
     plt.close(chart)
 
 
+def _validation_sample_mode(predictor: WiFiFingerprintPredictor) -> None:
+    """Predict a validation row from WAP-only features, then display its labels."""
+    try:
+        validation_data = load_validation_samples()
+    except DatasetLoadError as exc:
+        st.error(f"Could not load UJIIndoorLoc validation samples: {exc}")
+        return
+    if validation_data.empty:
+        st.error("The UJIIndoorLoc validation CSV contains no samples.")
+        return
+
+    sample_index = st.number_input(
+        "Validation sample row / index",
+        min_value=0,
+        max_value=len(validation_data) - 1,
+        value=0,
+        step=1,
+        help=f"Choose a row from 0 to {len(validation_data) - 1}.",
+        key="validation_sample_index",
+    )
+    st.caption(
+        f"{len(validation_data):,} official validation samples are available. "
+        "Only WAP001-WAP520 will be passed to the saved model."
+    )
+    if not st.button("Run Prediction", type="primary", key="run_validation_prediction"):
+        return
+
+    row = validation_data.iloc[int(sample_index)]
+    try:
+        wap_frame = validate_upload(validation_data.iloc[[int(sample_index)]])
+        result = _predict_fingerprint(predictor, wap_frame)
+    except (ValueError, RuntimeError, TypeError) as exc:
+        st.error(f"Could not predict this validation sample: {exc}")
+        return
+
+    ground_truth = _get_ground_truth(row)
+    if ground_truth is None:
+        st.error("This validation row does not have complete numeric ground truth.")
+        return
+    _render_prediction(predictor, result, ground_truth)
+
+
 def _csv_input(predictor: WiFiFingerprintPredictor) -> None:
-    """Upload a WAP CSV, predict each sample, and display a selected row."""
+    """Run inference for every row in an uploaded WAP CSV."""
     uploaded_file = st.file_uploader(
-        "Upload a CSV with WAP001-WAP520 columns",
+        "Upload a CSV containing WAP001-WAP520",
         type=["csv"],
         key="fingerprint_csv",
     )
     if uploaded_file is None:
-        st.caption("The CSV may contain one or more samples; extra columns are ignored.")
+        st.caption(
+            "A CSV may contain one or many fingerprints. Ground-truth columns "
+            "are optional and are excluded from model input."
+        )
         return
 
     try:
         uploaded = pd.read_csv(BytesIO(uploaded_file.getvalue()), low_memory=False)
         wap_frame = validate_upload(uploaded)
-    except (ValueError, pd.errors.ParserError, UnicodeDecodeError) as exc:
-        st.error(f"Invalid fingerprint CSV: {exc}")
-        return
-
-    try:
         predictions = predictor.predict_batch(wap_frame)
-    except (ValueError, RuntimeError, TypeError) as exc:
-        st.error(f"Could not predict uploaded fingerprints: {exc}")
+    except (ValueError, RuntimeError, TypeError, pd.errors.ParserError, UnicodeDecodeError) as exc:
+        st.error(f"Invalid fingerprint CSV or prediction input: {exc}")
         return
 
-    st.success(f"Validated {len(wap_frame):,} fingerprint(s).")
-    st.dataframe(
-        pd.DataFrame(predictions, index=range(len(predictions))).rename_axis("Sample"),
-        width="stretch",
-    )
+    st.success(f"Predicted {len(predictions):,} fingerprint(s).")
+    st.dataframe(pd.DataFrame(predictions), width="stretch", hide_index=True)
     selected_index = st.number_input(
         "Sample to visualize",
         min_value=0,
@@ -297,64 +563,69 @@ def _csv_input(predictor: WiFiFingerprintPredictor) -> None:
         key="csv_sample_index",
     )
     row_number = int(selected_index)
-    ground_truth = _get_ground_truth(uploaded.iloc[row_number])
-    if ground_truth is None and any(
-        column in uploaded.columns for column in GROUND_TRUTH_COLUMNS
-    ):
-        st.warning(
-            "Some ground-truth columns were found, but the complete numeric "
-            "LONGITUDE, LATITUDE, BUILDINGID, and FLOOR targets are required "
-            "to compare positions."
-        )
-    _display_prediction(
-        predictor,
-        wap_frame.iloc[[row_number]],
-        ground_truth,
-    )
+    try:
+        result = _predict_fingerprint(predictor, wap_frame.iloc[[row_number]])
+    except (ValueError, RuntimeError, TypeError) as exc:
+        st.error(f"Could not display this fingerprint: {exc}")
+        return
+
+    _render_prediction(predictor, result)
 
 
 def _manual_input(predictor: WiFiFingerprintPredictor) -> None:
-    """Collect manually entered RSSI values for detected WAPs."""
-    selected_waps = st.multiselect(
-        "Select detected access points",
-        options=RSSI_FEATURE_COLUMNS,
-        help=(
-            "Leave WAPs unselected when they were not detected. Unselected "
-            "features use the UJIIndoorLoc unavailable-signal value 100."
-        ),
-        key="manual_selected_waps",
-    )
-    with st.form("manual_fingerprint"):
-        values: dict[str, int] = {}
-        columns = st.columns(3)
-        for index, wap_name in enumerate(selected_waps):
-            with columns[index % len(columns)]:
-                values[wap_name] = st.number_input(
-                    wap_name,
-                    min_value=-104,
-                    max_value=0,
-                    value=-70,
-                    step=1,
-                    help="RSSI in dBm; accepted range is -104 to 0.",
-                )
-        submitted = st.form_submit_button("Predict location")
+    """Collect RSSI only for detected WAPs and mark all others unavailable."""
+    if "manual_wap_rows" not in st.session_state:
+        st.session_state.manual_wap_rows = [0]
+        st.session_state.manual_wap_row_count = 1
 
-    if submitted:
-        if not selected_waps:
-            st.error("Select at least one detected WAP and enter its RSSI value.")
-            return
-        fingerprint = {column: RSSI_MISSING_VALUE for column in RSSI_FEATURE_COLUMNS}
-        fingerprint.update(values)
-        try:
-            wap_frame = validate_upload(pd.DataFrame([fingerprint]))
-        except ValueError as exc:
-            st.error(f"Invalid manual fingerprint: {exc}")
-            return
-        _display_prediction(predictor, wap_frame, None)
+    st.caption(
+        "Add one row per detected access point. Unlisted WAPs are set to the "
+        "UJIIndoorLoc not-detected value (100)."
+    )
+    if st.button("Add detected WAP", key="add_manual_wap"):
+        row_id = st.session_state.manual_wap_row_count
+        st.session_state.manual_wap_rows.append(row_id)
+        st.session_state.manual_wap_row_count += 1
+        st.rerun()
+
+    with st.form("manual_fingerprint"):
+        entries: list[dict[str, object]] = []
+        for row_id in st.session_state.manual_wap_rows:
+            wap_id, rssi = st.columns((2, 1))
+            with wap_id:
+                selected_wap = st.selectbox(
+                    f"WAP ID — row {row_id + 1}",
+                    options=(None, *RSSI_FEATURE_COLUMNS),
+                    format_func=lambda value: value or "Select detected WAP",
+                    key=f"manual_wap_{row_id}",
+                )
+            with rssi:
+                selected_rssi = st.number_input(
+                    f"RSSI (dBm) — row {row_id + 1}",
+                    min_value=RSSI_MIN_VALUE,
+                    max_value=RSSI_MAX_VALUE,
+                    value=None,
+                    step=1,
+                    key=f"manual_rssi_{row_id}",
+                    help=f"Valid detected signal: {RSSI_MIN_VALUE} to "
+                    f"{RSSI_MAX_VALUE} dBm. 100 means not detected.",
+                )
+            entries.append({"WAP ID": selected_wap, "RSSI": selected_rssi})
+        submitted = st.form_submit_button("Run Prediction", type="primary")
+
+    if not submitted:
+        return
+    try:
+        fingerprint = build_manual_fingerprint(pd.DataFrame(entries))
+        result = _predict_fingerprint(predictor, fingerprint)
+    except (ValueError, RuntimeError, TypeError) as exc:
+        st.error(f"Invalid manual fingerprint: {exc}")
+        return
+    _render_prediction(predictor, result)
 
 
 def main() -> None:
-    """Render the inference-only WiFi fingerprint application."""
+    """Render the three-mode, inference-only WiFi fingerprint application."""
     st.set_page_config(
         page_title="WiFi Fingerprinting Indoor Localization",
         page_icon="📍",
@@ -366,7 +637,8 @@ def main() -> None:
         "fingerprints using the saved Weighted K-Nearest Neighbors model."
     )
     st.info(
-        "This app performs inference only. It does not train or modify the model."
+        "Inference only: the app loads the saved WKNN model and fitted "
+        "preprocessor; it does not retrain or scan WiFi hardware."
     )
 
     try:
@@ -380,11 +652,14 @@ def main() -> None:
         st.stop()
 
     input_mode = st.radio(
-        "Fingerprint input method",
-        ("Upload CSV", "Enter RSSI values manually"),
+        "Fingerprint input mode",
+        INPUT_MODES,
         horizontal=True,
+        key="fingerprint_input_mode",
     )
-    if input_mode == "Upload CSV":
+    if input_mode == INPUT_MODES[0]:
+        _validation_sample_mode(predictor)
+    elif input_mode == INPUT_MODES[1]:
         _csv_input(predictor)
     else:
         _manual_input(predictor)
